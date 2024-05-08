@@ -71,6 +71,7 @@ contract SoulBounds is Ownable, Pausable {
 
     // Errors
     error MetadataKeyNotAllowed();
+    error MetaKeyNotFound();
     error SoulAlreadyExist();
     error IdentityIsNotUnique();
     error EmptyUrl();
@@ -170,20 +171,33 @@ contract SoulBounds is Ownable, Pausable {
     }
 
     /**
-     * @notice Burns an existing soul.
-     * @param _soul Address of the soul to be burned.
-     */
+    * @notice Burns an existing soul and clears all associated metadata.
+    * @param _soul Address of the soul to be burned.
+    */
     function burn(address _soul)
-        external
-        validAddress(_soul)
-        onlyOwnerOrUser(_soul)
-        whenNotPaused
+    external
+    validAddress(_soul)
+    onlyOwnerOrUser(_soul)
+    whenNotPaused
     {
-        bytes16 uuidToClear = _souls[_soul].uuid;
-        delete _souls[_soul];
+        Soul memory soulToBurn = _getValidSoul(_soul);
+
+        // Clear the identity and UUID tickers
+        bytes32 identityHash = keccak256(bytes(soulToBurn.identity));
+        _identityTicker[identityHash] = false;
+
+        bytes16 uuidToClear = soulToBurn.uuid;
         _uuidTicker[uuidToClear] = false;
+
+        // Clear all metadata associated with the soul
+        clearAllMetadata(_soul);
+
+        // Remove the soul itself
+        delete _souls[_soul];
+
         emit Burn(_soul);
     }
+
 
     /**
      * @dev Validates and sanitizes the Soul data fields, considering only specific fields.
@@ -202,9 +216,9 @@ contract SoulBounds is Ownable, Pausable {
             revert EmptyUrl();
         }
 
-        bool soulExists = keccak256(bytes(_souls[_soul].identity)) != _baseHash;
+        bool soulNotExists = bytes(_souls[_soul].identity).length == 0;
 
-        if (!soulExists && msg.sig == this.mint.selector) {
+        if (!soulNotExists) {
             revert SoulAlreadyExist();
         }
     }
@@ -234,10 +248,7 @@ contract SoulBounds is Ownable, Pausable {
     returns (Soul memory soulData, bytes32[] memory keys, bytes[] memory values)
     {
 
-        bool soulExists = keccak256(bytes(_souls[_soul].identity)) != _baseHash;
-        if (!soulExists) revert SoulDoesNotExist();
-
-        soulData = _souls[_soul];
+        soulData = _getValidSoul(_soul);
 
         if (_includeMetadata) {
             (keys, values) = _getAllMetadata(_soul);
@@ -262,7 +273,14 @@ contract SoulBounds is Ownable, Pausable {
      * @return Value of the requested metadata field as bytes.
      */
     function getMetadata(address _soul, bytes32 _key) external view returns (bytes memory) {
-        return _soulMetadata[_soul][_key];
+        _getValidSoul(_soul);
+        bytes memory metadataValue = _soulMetadata[_soul][_key];
+
+        if (metadataValue.length == 0) {
+            revert MetaKeyNotFound();
+        }
+    
+        return metadataValue;
     }
 
     /**
@@ -306,49 +324,127 @@ contract SoulBounds is Ownable, Pausable {
     }
 
     /**
-     * @dev Sets or updates metadata for a given soul address if the key is allowed.
-     * @param _soul Address of the soul to update.
-     * @param _key Key identifier of the metadata field.
-     * @param _value New value of the metadata field.
-     */
+    * @dev Sets or updates metadata for a given soul address if the key is allowed.
+    * @param _soul Address of the soul to update.
+    * @param _key Key identifier of the metadata field.
+    * @param _value New value of the metadata field.
+    */
     function setMetadata(address _soul, bytes32 _key, bytes calldata _value) external onlyOwner whenNotPaused {
         if (!_allowedKeys[_key]) revert MetadataKeyNotAllowed();
+        _getValidSoul(_soul);
 
-        // Track the key if it's a new entry for this soul
-        if (_soulMetadata[_soul][_key].length == 0) {
-            _metadataKeys[_soul].push(_key);
+        // Prevent duplicate entries in the keys array
+        bytes32[] storage keys = _metadataKeys[_soul];
+        bool keyExists = false;
+        for (uint256 i = 0; i < keys.length; i++) {
+            if (keys[i] == _key) {
+                keyExists = true;
+                break;
+            }
         }
 
+        // Add key only if it's not already present
+        if (!keyExists) {
+            keys.push(_key);
+        }
+
+        // Set or update the metadata
         _soulMetadata[_soul][_key] = _value;
     }
 
     /**
-     * @dev Deletes metadata for a given soul address and key.
-     * @param _soul Address of the soul.
-     * @param _key Key identifier of the metadata field.
-     */
+    * @dev Deletes metadata for a given soul address and key.
+    * @param _soul Address of the soul.
+    * @param _key Key identifier of the metadata field.
+    */
     function deleteMetadata(address _soul, bytes32 _key) external onlyOwner whenNotPaused {
+        // Ensure the key is allowed
         if (!_allowedKeys[_key]) revert MetadataKeyNotAllowed();
+        
+        // Validate that the soul exists
+        _getValidSoul(_soul);
+        
+        // Ensure the metadata key exists for this soul
+        if (_soulMetadata[_soul][_key].length == 0) {
+            revert MetaKeyNotFound();
+        }
+
+        // Delete the metadata entry and remove the key from `_metadataKeys`
+        bytes32[] storage keys = _metadataKeys[_soul];
+        for (uint256 i = 0; i < keys.length; i++) {
+            if (keys[i] == _key) {
+                keys[i] = keys[keys.length - 1];
+                keys.pop();
+                break;
+            }
+        }
+
         delete _soulMetadata[_soul][_key];
+    }
+
+    /**
+    * @dev Clears all metadata for a given soul address.
+    * @param _soul Address of the soul.
+    */
+    function clearAllMetadata(address _soul) public onlyOwner whenNotPaused {
+        _getValidSoul(_soul);
+
+        // Clear each key and remove all metadata
+        bytes32[] storage keys = _metadataKeys[_soul];
+        for (uint256 i = 0; i < keys.length; i++) {
+            delete _soulMetadata[_soul][keys[i]];
+        }
+
+        // Clear the list of keys
+        delete _metadataKeys[_soul];
     }
 
     /* internal ------------------------------------------------------------------------------------- */
 
     /**
-    * @notice Returns all metadata for a specified soul as arrays of keys and values.
+     * @dev Internal function to retrieve and validate a soul.
+     * @param _soul Address of the soul.
+     * @return soulData The `Soul` struct containing the requested data.
+     * @notice Reverts with `SoulDoesNotExist` error if the soul does not exist.
+     */
+     function _getValidSoul(address _soul) internal view returns (Soul memory soulData) {
+        soulData = _souls[_soul];
+        if (bytes(soulData.identity).length == 0) {
+            revert SoulDoesNotExist();
+        }
+        return soulData;
+    }
+    
+    /**
+    * @notice Returns all metadata for a specified soul as arrays of keys and values, excluding disallowed keys.
     * @param _soul Address of the soul.
-    * @return keys Array of all metadata keys.
+    * @return keys Array of all allowed metadata keys.
     * @return values Array of associated values.
     */
     function _getAllMetadata(address _soul) internal view returns (bytes32[] memory keys, bytes[] memory values) {
-        uint256 count = _metadataKeys[_soul].length;
-        keys = new bytes32[](count);
-        values = new bytes[](count);
+        bytes32[] storage allKeys = _metadataKeys[_soul];
+        uint256 allowedCount = 0;
 
-        for (uint256 i = 0; i < count; i++) {
-            bytes32 key = _metadataKeys[_soul][i];
-            keys[i] = key;
-            values[i] = _soulMetadata[_soul][key];
+        // Count only allowed keys to initialize arrays of the right size
+        for (uint256 i = 0; i < allKeys.length; i++) {
+            if (_allowedKeys[allKeys[i]]) {
+                allowedCount++;
+            }
+        }
+
+        // Initialize the result arrays
+        keys = new bytes32[](allowedCount);
+        values = new bytes[](allowedCount);
+
+        // Populate arrays with allowed keys and their corresponding values
+        uint256 index = 0;
+        for (uint256 i = 0; i < allKeys.length; i++) {
+            bytes32 key = allKeys[i];
+            if (_allowedKeys[key]) {
+                keys[index] = key;
+                values[index] = _soulMetadata[_soul][key];
+                index++;
+            }
         }
 
         return (keys, values);
