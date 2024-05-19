@@ -1,34 +1,53 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.17;
+pragma solidity ^0.8.0;
 
-import {
-    Ownable,
-    Pausable,
-    SafeERC20,
-    IERC20,
-    Address
-} from "./Base.sol";
+/**
+    working on...
+*/
+
+// imports
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { SafeERC20, IERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { Pausable } from "@openzeppelin/contracts/security/Pausable.sol";
+import { ERC721Enumerable } from "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
+import { ERC721, IERC721 } from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import { ERC721Holder } from "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
+import { IERC2981, ERC2981 } from "@openzeppelin/contracts/token/common/ERC2981.sol";
+import { Strings } from "@openzeppelin/contracts/utils/Strings.sol";
+import { Address } from "./libs/Address.sol";
+import { IValidation } from "./libs/IValidation.sol";
 
 /**
  * @title SoulBounds
- * @notice This contract allows minting, burning, and updating soul-bound assets with unique identities.
- * @dev The contract relies on Ownable and Pausable modifiers and uses SafeERC20 and Address libraries.
+ * @notice This contract allows minting, burning, and updating non-transferable (NTT) 
+ * soul-bound tokens (SBTs) with unique identities.
+ * @dev This contract is based on Ownable and Pausable modifiers and utilizes SafeERC20 and Address libraries.
+ * It ensures the uniqueness of each soul by validating identities and URLs.
+ * Provides functionalities for managing metadata associated with each soul.
+ * The contract supports secure withdrawal of tokens and validates contract interactions.
+ * Soul-bound tokens are not tradable and represent unique, non-transferable identities.
+ * @dev This contract has the ability to schedule trading On/Off tokens with Royalties.
  */
-contract SoulBounds is Ownable, Pausable {
+contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder, ERC2981 {
     using SafeERC20 for IERC20;
     using Address for address;
+    using Strings for uint256;
 
-    IERC20 private _baseAsset;
-
+    uint256 public constant ZERO = 0;
+    uint256 private _mintingPrice;
+    address private _paymentToken;
+    address private _royaltyReceiver;
+    string private _baseUrl;
+    bool private _tradeOnOff;
+    
     /**
-     * @dev Represents an individual's soul, consisting of their identity, associated URL, and metadata.
+     * @dev Represents an individual's soul, consisting of their identity and metadata.
      */
     struct Soul {
-        string identity;
-        string url;
         uint256 mintedAt;
         uint256 lastUpdate;
         bytes16 uuid;
+        uint256 tokenId;
     }
 
     uint256 private constant _THOUSAND = 1_000;
@@ -37,9 +56,9 @@ contract SoulBounds is Ownable, Pausable {
     bytes32 private _baseHash;
 
     mapping(address => Soul) private _souls;
-    mapping(bytes32 => bool) private _identityTicker;
     mapping(bytes16 => bool) private _uuidTicker;
     mapping(bytes32 => bool) private _allowedKeys;
+    mapping(bytes32 => bool) private _immutableMetaDataKeys;
     mapping(address => mapping(bytes32 => bytes)) private _soulMetadata;
     mapping(address => bytes32[]) private _metadataKeys;
 
@@ -68,8 +87,13 @@ contract SoulBounds is Ownable, Pausable {
      * @param _amount Amount of tokens withdrawn.
      */
     event Withdrawal(address indexed _owner, address indexed _destination, uint256 indexed _amount);
+    event NativeTokenReceived(address indexed _sender, uint256 indexed _amount);
+    event PaymentTokenUpdated(address indexed _paymentToken);
+    event MintingPriceUpdated(uint256 indexed _mintingPrice);
+    event TradePeriodUpdated(bool indexed _tradeOnOff);
 
     // Errors
+    error IncorrectFundsSent();
     error MetadataKeyNotAllowed();
     error MetaKeyNotFound();
     error SoulAlreadyExist();
@@ -82,6 +106,10 @@ contract SoulBounds is Ownable, Pausable {
     error InvalidContractInteraction();
     error TokenAmountIsZero();
     error NotPermitted();
+    error MintingDisabled();
+    error TokenNotExist();
+    error TheMetaDataKeyIsImmutable(string reason);
+    error InvalidTradePeriod();
 
     // Modifiers
 
@@ -120,16 +148,31 @@ contract SoulBounds is Ownable, Pausable {
 
     /**
      * @dev Sets up the base asset and computes the initial base hash.
-     * @param _token Address of the base asset token.
+     * @param tokenAddress Address of the base asset token.
      */
-    constructor(address _token) {
-        if (!_token.isContract()) revert InvalidContractInteraction();
-        _baseAsset = IERC20(_token);
-        _baseHash = keccak256(abi.encodePacked(_token));
+    constructor(
+        address tokenAddress, 
+        string memory url,
+        string memory tokenName,
+        string memory symbol,
+        address royaltyReceiver,
+        uint96 royaltyFeeNumerator
+    ) ERC721(tokenName, symbol) {
+        if (
+            !IValidation.validateERC20Token(tokenAddress) 
+            && tokenAddress != address(0)) revert InvalidContractInteraction();
+        _paymentToken = tokenAddress;
+        _baseHash = keccak256(abi.encodePacked(tokenAddress));
+        _mintingPrice = 0.01 ether; // Default price in case of native token payment
+        _baseUrl = url;
+        _tradeOnOff = false;
+        _royaltyReceiver = royaltyReceiver;
+        _pause(); // Start paused
+        _setDefaultRoyalty(royaltyReceiver, royaltyFeeNumerator);
     }
 
     receive() external payable {
-        revert NotPermitted();
+        emit NativeTokenReceived(msg.sender, msg.value);
     }
 
     fallback() external payable {
@@ -139,180 +182,292 @@ contract SoulBounds is Ownable, Pausable {
     /* mechanics -----------------------------------------------------------------------------------*/
 
     /**
-     * @notice Mints a new soul with specified data.
-     * @dev Only the owner can mint new souls.
-     * @param _soul Address of the new soul to be minted.
-     * @param _identity Identity field of the soul to be minted.
-     * @param _url URL field of the soul to be minted.
+     * @notice Mints a new soul.
+     * @dev Supports both ETH and ERC20 payments.
      */
-    function mint(address _soul, bytes calldata _identity, bytes calldata _url)
-        external
-        validAddress(_soul)
-        onlyOwner
-        whenNotPaused
-    {
-        _sanitizeAndValidate(_soul, _identity, _url);
+    function mint() external payable whenNotPaused {
+        address soulAddress = msg.sender;
+
+        if (_paymentToken == address(0)) {
+            if (msg.value != _mintingPrice) revert IncorrectFundsSent();
+        } else {
+            if (msg.value > ZERO) {
+                revert IncorrectFundsSent();
+            }
+            IERC20(_paymentToken).safeTransferFrom(soulAddress, address(this), _mintingPrice);
+        }
+
+        _sanitizeAndValidate(soulAddress);
+
+        uint256 tokenId = totalSupply() + 1;
 
         // Register the new soul
         Soul memory newSoul = Soul({
-            identity: string(_identity),
-            url: string(_url),
             mintedAt: block.timestamp,
             lastUpdate: block.timestamp,
-            uuid: _generateUUID(_soul, 1)
+            uuid: _generateUUID(soulAddress, 1),
+            tokenId: tokenId
         });
 
-        _souls[_soul] = newSoul;
-        _identityTicker[keccak256(_identity)] = true;
+        _souls[soulAddress] = newSoul;
         _uuidTicker[newSoul.uuid] = true;
         _soulTicker += 1;
 
-        emit Mint(_soul);
+        _safeMint(soulAddress, tokenId);
+
+        emit Mint(soulAddress);
     }
 
     /**
     * @notice Burns an existing soul and clears all associated metadata.
-    * @param _soul Address of the soul to be burned.
+    * @param soulAddress Address of the soul to be burned.
     */
-    function burn(address _soul)
-    external
-    validAddress(_soul)
-    onlyOwnerOrUser(_soul)
-    whenNotPaused
+    function burn(address soulAddress)
+        external
+        validAddress(soulAddress)
+        onlyOwnerOrUser(soulAddress)
+        whenNotPaused
     {
-        Soul memory soulToBurn = _getValidSoul(_soul);
-
-        // Clear the identity and UUID tickers
-        bytes32 identityHash = keccak256(bytes(soulToBurn.identity));
-        _identityTicker[identityHash] = false;
+        Soul memory soulToBurn = _getValidSoul(soulAddress);
 
         bytes16 uuidToClear = soulToBurn.uuid;
         _uuidTicker[uuidToClear] = false;
 
-        // Clear all metadata associated with the soul
-        clearAllMetadata(_soul);
+        _clearAllMetadataInternal(soulAddress);
 
-        // Remove the soul itself
-        delete _souls[_soul];
+        delete _souls[soulAddress];
 
-        emit Burn(_soul);
-    }
+        _burn(soulToBurn.tokenId);
 
-
-    /**
-     * @dev Validates and sanitizes the Soul data fields, considering only specific fields.
-     * @param _soul Address associated with the Soul.
-     * @param _identity Identity field of the Soul to validate, represented as bytes.
-     * @param _url URL field of the Soul to validate, represented as bytes.
-     */
-    function _sanitizeAndValidate(address _soul, bytes calldata _identity, bytes calldata _url) internal view {
-        // Check if the identity is unique
-        if (_identityTicker[keccak256(_identity)]) {
-            revert IdentityIsNotUnique();
-        }
-
-        // Check if the URL is empty
-        if (_url.length == 0) {
-            revert EmptyUrl();
-        }
-
-        bool soulNotExists = bytes(_souls[_soul].identity).length == 0;
-
-        if (!soulNotExists) {
-            revert SoulAlreadyExist();
-        }
+        emit Burn(soulAddress);
     }
 
     /* getters ------------------------------------------------------------------------------------ */
 
     /**
-     * @notice Returns the address of the base asset token.
-     * @return address Address of the base asset token.
-     */
-    function getBaseAsset() external view returns (address) {
-        return address(_baseAsset);
-    }
-
-    /**
     * @notice Returns the data of a specified soul with optional metadata.
-    * @param _soul Address of the soul.
-    * @param _includeMetadata If true, includes all metadata in the returned data.
-    * @return soulData Memory representation of the soul data.
-    * @return keys Array of all metadata keys (if requested).
-    * @return values Array of associated values (if requested).
+    * @param soulAddress Address of the soul.
+    * @param includeMetadata If true, includes all metadata in the returned data.
+    * @return soulData Memory struct representing the soul, including optional metadata.
+    * @return keys Array of metadata keys.
+    * @return values Array of metadata values.
     */
-    function getSoul(address _soul, bool _includeMetadata)
-    external
-    view
-    validAddress(_soul)
-    returns (Soul memory soulData, bytes32[] memory keys, bytes[] memory values)
+    function getSoul(address soulAddress, bool includeMetadata) 
+    external view returns (Soul memory soulData, bytes32[] memory keys, bytes[] memory values) 
     {
+        soulData = _getValidSoul(soulAddress);
 
-        soulData = _getValidSoul(_soul);
-
-        if (_includeMetadata) {
-            (keys, values) = _getAllMetadata(_soul);
+        if (includeMetadata) {
+            (keys, values) = _getMetadata(soulAddress);
         }
 
         return (soulData, keys, values);
     }
 
-    /**
-     * @dev Checks if a given metadata key is allowed.
-     * @param _key Key identifier of the metadata field.
-     * @return bool True if the key is allowed, otherwise false.
-     */
-    function isMetadataKeyAllowed(bytes32 _key) external view returns (bool) {
-        return _allowedKeys[_key];
-    }
-
-    /**
-     * @dev Returns the metadata value for a given soul address and key.
-     * @param _soul Address of the soul.
-     * @param _key Key identifier of the metadata field.
-     * @return Value of the requested metadata field as bytes.
-     */
-    function getMetadata(address _soul, bytes32 _key) external view returns (bytes memory) {
-        _getValidSoul(_soul);
-        bytes memory metadataValue = _soulMetadata[_soul][_key];
-
-        if (metadataValue.length == 0) {
-            revert MetaKeyNotFound();
+    function _getMetadata(address soulAddress) internal view returns (bytes32[] memory keys, bytes[] memory values) {
+        uint256 metadataCount = _metadataKeys[soulAddress].length;
+        bytes32[] memory tempKeys = new bytes32[](metadataCount);
+        bytes[] memory tempValues = new bytes[](metadataCount);
+    
+        uint256 index = 0;
+        for (uint256 i = 0; i < metadataCount; i++) {
+            bytes32 key = _metadataKeys[soulAddress][i];
+            if (_allowedKeys[key]) {
+                tempKeys[index] = key;
+                tempValues[index] = _soulMetadata[soulAddress][key];
+                index++;
+            }
         }
     
-        return metadataValue;
+        bytes32[] memory filteredKeys = new bytes32[](index);
+        bytes[] memory filteredValues = new bytes[](index);
+    
+        for (uint256 i = 0; i < index; i++) {
+            filteredKeys[i] = tempKeys[index - 1 - i];
+            filteredValues[i] = tempValues[index - 1 - i];
+        }
+    
+        return (filteredKeys, filteredValues);
     }
 
     /**
-     * @notice Returns the current soul ticker (nonce).
-     * @return uint256 Current soul ticker value.
+    * @notice Returns metadata for a given soul address and key.
+    * @param soulAddress Address of the soul.
+    * @param key Metadata key.
+    * @return value Metadata value.
+    */
+    function getMetadata(address soulAddress, bytes32 key) external view validAddress(soulAddress)
+    returns (bytes memory value)
+    {
+        if (!_allowedKeys[key]) {
+            revert MetadataKeyNotAllowed();
+        }
+
+        _getValidSoul(soulAddress);
+
+        value = _soulMetadata[soulAddress][key];
+    }
+
+
+    /**
+     * @notice Returns the address of the payment token.
+     * @return address Address of the payment token.
      */
-    function getNounce() external view returns (uint256) {
+    function getPaymentToken() external view returns (address) {
+        return _paymentToken;
+    }
+
+    function getTradeOnOff() external view returns (bool) {
+        return _tradeOnOff;
+    }
+
+    /**
+     * @notice Returns the minting price for the soul-bound tokens.
+     * @dev Supports payment in native token or ERC20 token.
+     * @return uint256 Current minting price.
+     */
+    function getMintingPrice() external view returns (uint256) {
+        return _mintingPrice;
+    }
+
+    /**
+     * @dev Returns the number of tokens minted so far.
+     * @return uint256 The current token counter.
+     */
+    function soulTicker() external view returns (uint256) {
         return _soulTicker;
     }
 
     /**
-     * @dev Returns the current chain ID.
-     * @return uint256 Current chain ID.
+     * @dev Returns the base URI for all tokens.
+     * @return string Memory representing the base URI.
      */
-    function _chainID() private view returns (uint256) {
-        uint256 chainID;
-        /* solhint-disable */
-        assembly {
-            chainID := chainid()
-        }
-         /* solhint-enable */
-        return chainID;
+    function _baseURI() internal view override returns (string memory) {
+        return _baseUrl;
     }
 
-    /* setter ------------------------------------------------------------------------------------- */
+    /**
+     * @dev Returns the URI for a given token ID.
+     * @param tokenId The token ID for which to return the URI.
+     * @return string Memory representing the token URI.
+     */
+    function tokenURI(uint256 tokenId) public view virtual override returns (string memory) {
+        if (!_exists(tokenId)) revert TokenNotExist();
+        string memory baseURI = _baseURI();
+        return bytes(baseURI).length > 0 ? string(abi.encodePacked(baseURI, tokenId.toString())) : "";
+    }
+
+    /**
+     * @notice Checks if the soul for a given address exists.
+     * @param soulAddress Address to check.
+     * @return exists True if the soul exists, false otherwise.
+     */
+    function soulExists(address soulAddress) external view returns (bool) {
+        return _souls[soulAddress].tokenId != 0;
+    }
+
+    /**
+    * @notice Returns royalty information for a token.
+    * @param tokenId Token ID to query.
+    * @param salePrice Sale price of the token.
+    * @return receiver Address receiving the royalty.
+    * @return royaltyAmount Amount of royalty to be paid.
+    */
+    function royaltyInfo(uint256 tokenId, uint256 salePrice) public view override
+    returns (address receiver, uint256 royaltyAmount)
+    {
+        return super.royaltyInfo(tokenId, salePrice);
+    }
+
+    /* setters ------------------------------------------------------------------------------------- */
+
+    /**
+     * @notice Sets or updates metadata for a given soul address.
+     * @param soulAddress Address of the soul to update.
+     * @param key Metadata key.
+     * @param value Metadata value.
+     */
+    function setMetadata(address soulAddress, bytes32 key, bytes calldata value)
+        external
+        validAddress(soulAddress)
+        onlyOwner
+        whenNotPaused
+    {
+        if (!_allowedKeys[key]) {
+            revert MetadataKeyNotAllowed();
+        }
+        
+        _getValidSoul(soulAddress);
+
+        bytes32[] storage keys = _metadataKeys[soulAddress];
+        bool keyExists = false;
+
+        for (uint256 i = 0; i < keys.length; i++) {
+            if (keys[i] == key) {
+                keyExists = true;
+                continue;
+            }
+        }
+
+        if (!keyExists) {
+            _metadataKeys[soulAddress].push(key);
+        }
+
+        _soulMetadata[soulAddress][key] = value;
+        _souls[soulAddress].lastUpdate = block.timestamp;
+
+        emit Update(soulAddress);
+    }
+
+    /**
+     * @notice Deletes a specific metadata key for a given soul address.
+     * @param soulAddress Address of the soul.
+     * @param key Metadata key to delete.
+     */
+    function deleteMetadata(address soulAddress, bytes32 key)
+        external
+        validAddress(soulAddress)
+        onlyOwner
+        whenNotPaused
+    {
+        if (!_allowedKeys[key]) {
+            revert MetadataKeyNotAllowed();
+        }
+
+        _getValidSoul(soulAddress);
+
+        if (_immutableMetaDataKeys[key]) revert TheMetaDataKeyIsImmutable("Use forceMetakeySwitch()");
+
+        delete _soulMetadata[soulAddress][key];
+        _souls[soulAddress].lastUpdate = block.timestamp;
+
+        for (uint256 i = 0; i < _metadataKeys[soulAddress].length; i++) {
+            if (_metadataKeys[soulAddress][i] == key) {
+                _metadataKeys[soulAddress][i] = _metadataKeys[soulAddress][_metadataKeys[soulAddress].length - 1];
+                _metadataKeys[soulAddress].pop();
+                break;
+            }
+        }
+
+        emit Update(soulAddress);
+    }
+
+    /**
+    * @dev Clears all metadata for a given soul address.
+    * @param _soul Address of the soul.
+    */
+    function clearAllMetadata(address _soul) external onlyOwner whenNotPaused {
+        _clearAllMetadataInternal(_soul);
+    }
 
     /**
      * @dev Adds a new metadata key to the whitelist.
      * @param _key The key to be added to the whitelist.
      */
-     function allowMetadataKey(bytes32 _key) external onlyOwner {
+    function allowMetadataKey(bytes32 _key, bool _isImmutable) external onlyOwner {
+        if (_immutableMetaDataKeys[_key]) revert TheMetaDataKeyIsImmutable("Use forceMetakeySwitch()");
         _allowedKeys[_key] = true;
+        _immutableMetaDataKeys[_key] = _isImmutable;
     }
 
     /**
@@ -320,134 +475,52 @@ contract SoulBounds is Ownable, Pausable {
      * @param _key The key to be removed from the whitelist.
      */
     function disallowMetadataKey(bytes32 _key) external onlyOwner {
+        if(_immutableMetaDataKeys[_key]) revert TheMetaDataKeyIsImmutable("Use forceMetakeySwitch()");
         _allowedKeys[_key] = false;
     }
 
     /**
-    * @dev Sets or updates metadata for a given soul address if the key is allowed.
-    * @param _soul Address of the soul to update.
-    * @param _key Key identifier of the metadata field.
-    * @param _value New value of the metadata field.
+    * @notice Forcefully switches a metadata key's allowed state and immutability.
+    * This function is restricted to the contract owner.
+    * 
+    * @param _key The metadata key to be modified.
+    * @param _isImmutable Boolean indicating whether the key should be immutable.
     */
-    function setMetadata(address _soul, bytes32 _key, bytes calldata _value) external onlyOwner whenNotPaused {
-        if (!_allowedKeys[_key]) revert MetadataKeyNotAllowed();
-        _getValidSoul(_soul);
-
-        // Prevent duplicate entries in the keys array
-        bytes32[] storage keys = _metadataKeys[_soul];
-        bool keyExists = false;
-        for (uint256 i = 0; i < keys.length; i++) {
-            if (keys[i] == _key) {
-                keyExists = true;
-                break;
-            }
-        }
-
-        // Add key only if it's not already present
-        if (!keyExists) {
-            keys.push(_key);
-        }
-
-        // Set or update the metadata
-        _soulMetadata[_soul][_key] = _value;
+    function forceMetakeySwitch(bytes32 _key, bool _isImmutable) external onlyOwner {
+        _allowedKeys[_key] = true;
+        _immutableMetaDataKeys[_key] = _isImmutable;
     }
 
-    /**
-    * @dev Deletes metadata for a given soul address and key.
-    * @param _soul Address of the soul.
-    * @param _key Key identifier of the metadata field.
-    */
-    function deleteMetadata(address _soul, bytes32 _key) external onlyOwner whenNotPaused {
-        // Ensure the key is allowed
-        if (!_allowedKeys[_key]) revert MetadataKeyNotAllowed();
-        
-        // Validate that the soul exists
-        _getValidSoul(_soul);
-        
-        // Ensure the metadata key exists for this soul
-        if (_soulMetadata[_soul][_key].length == 0) {
-            revert MetaKeyNotFound();
-        }
-
-        // Delete the metadata entry and remove the key from `_metadataKeys`
-        bytes32[] storage keys = _metadataKeys[_soul];
-        for (uint256 i = 0; i < keys.length; i++) {
-            if (keys[i] == _key) {
-                keys[i] = keys[keys.length - 1];
-                keys.pop();
-                break;
-            }
-        }
-
-        delete _soulMetadata[_soul][_key];
-    }
+    /* internal utilities ------------------------------------------------------------------------- */
 
     /**
-    * @dev Clears all metadata for a given soul address.
-    * @param _soul Address of the soul.
-    */
-    function clearAllMetadata(address _soul) public onlyOwner whenNotPaused {
-        _getValidSoul(_soul);
-
-        // Clear each key and remove all metadata
-        bytes32[] storage keys = _metadataKeys[_soul];
-        for (uint256 i = 0; i < keys.length; i++) {
-            delete _soulMetadata[_soul][keys[i]];
-        }
-
-        // Clear the list of keys
-        delete _metadataKeys[_soul];
-    }
-
-    /* internal ------------------------------------------------------------------------------------- */
-
-    /**
-     * @dev Internal function to retrieve and validate a soul.
-     * @param _soul Address of the soul.
-     * @return soulData The `Soul` struct containing the requested data.
-     * @notice Reverts with `SoulDoesNotExist` error if the soul does not exist.
+     * @dev Validates and sanitizes the Soul data fields, considering only specific fields.
+     * @param soulAddress Address associated with the Soul.
      */
-     function _getValidSoul(address _soul) internal view returns (Soul memory soulData) {
-        soulData = _souls[_soul];
-        if (bytes(soulData.identity).length == 0) {
-            revert SoulDoesNotExist();
+    function _sanitizeAndValidate(address soulAddress) internal view {
+        bool _soulExists = _souls[soulAddress].mintedAt != 0;
+
+        if (_soulExists) {
+            revert SoulAlreadyExist();
         }
-        return soulData;
     }
-    
+
     /**
-    * @notice Returns all metadata for a specified soul as arrays of keys and values, excluding disallowed keys.
-    * @param _soul Address of the soul.
-    * @return keys Array of all allowed metadata keys.
-    * @return values Array of associated values.
+    * @dev Clears all metadata for a given soul address internally.
+    * This function is intended to be called from within the contract,
+    * and it bypasses the `onlyOwner` restriction.
+    * 
+    * @param soulAddress Address of the soul whose metadata is to be cleared.
     */
-    function _getAllMetadata(address _soul) internal view returns (bytes32[] memory keys, bytes[] memory values) {
-        bytes32[] storage allKeys = _metadataKeys[_soul];
-        uint256 allowedCount = 0;
+    function _clearAllMetadataInternal(address soulAddress) internal {
+        _getValidSoul(soulAddress);
 
-        // Count only allowed keys to initialize arrays of the right size
-        for (uint256 i = 0; i < allKeys.length; i++) {
-            if (_allowedKeys[allKeys[i]]) {
-                allowedCount++;
-            }
+        bytes32[] storage keys = _metadataKeys[soulAddress];
+        for (uint256 i = 0; i < keys.length; i++) {
+            delete _soulMetadata[soulAddress][keys[i]];
         }
 
-        // Initialize the result arrays
-        keys = new bytes32[](allowedCount);
-        values = new bytes[](allowedCount);
-
-        // Populate arrays with allowed keys and their corresponding values
-        uint256 index = 0;
-        for (uint256 i = 0; i < allKeys.length; i++) {
-            bytes32 key = allKeys[i];
-            if (_allowedKeys[key]) {
-                keys[index] = key;
-                values[index] = _soulMetadata[_soul][key];
-                index++;
-            }
-        }
-
-        return (keys, values);
+        delete _metadataKeys[soulAddress];
     }
 
     /**
@@ -456,6 +529,20 @@ contract SoulBounds is Ownable, Pausable {
      */
     function _startTokenId() internal pure returns (uint256) {
         return _THOUSAND;
+    }
+
+    /**
+     * @dev Returns the current chain ID.
+     * @return uint256 Current chain ID.
+     */
+    function _chainID() internal view returns (uint256) {
+        uint256 chainID;
+        /* solhint-disable */
+        assembly {
+            chainID := chainid()
+        }
+        /* solhint-enable */
+        return chainID;
     }
 
     /**
@@ -475,7 +562,122 @@ contract SoulBounds is Ownable, Pausable {
         }
     }
 
+    /**
+     * @dev Retrieves the valid soul data for a given address.
+     * @param soulAddress Address of the soul to retrieve.
+     * @return Soul memory struct representing the valid soul.
+     */
+    function _getValidSoul(address soulAddress) internal view returns (Soul memory) {
+        Soul memory soulData = _souls[soulAddress];
+        if (soulData.mintedAt == 0) {
+            revert SoulDoesNotExist();
+        }
+        return soulData;
+    }
+
+    /* NFT Mechanics------------------------------------------------------------------------------- */
+ 
+    function transferFrom(address from, address to, uint256 tokenId) public override(ERC721, IERC721) {
+        if(!_tradeOnOff) revert NotPermitted();
+        super.transferFrom(from, to, tokenId);
+    }
+
+    function safeTransferFrom(
+        address from, 
+        address to, 
+        uint256 tokenId) public override(ERC721, IERC721) {
+        if(!_tradeOnOff) revert NotPermitted();
+        super.safeTransferFrom(from, to, tokenId);
+    }
+
+    function safeTransferFrom(
+        address from, 
+        address to, 
+        uint256 tokenId, 
+        bytes memory _data) public override(ERC721, IERC721) {
+        if(!_tradeOnOff) revert NotPermitted();
+        super.safeTransferFrom(from, to, tokenId, _data);
+    }
+
+    // The following functions are overrides required by Solidity.
+
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 tokenId,
+        uint256 batchSize
+    ) internal override(ERC721, ERC721Enumerable) {
+        super._beforeTokenTransfer(from, to, tokenId, batchSize);
+        if (from != address(0) && to != address(0)) {
+            if (_tradeOnOff == false) revert NotPermitted();
+        }
+    }
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(ERC721, ERC721Enumerable, ERC2981)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+
     /* administrator -------------------------------------------------------------------------------- */
+
+    /**
+     * @notice Sets the payment token address.
+     * @param tokenAddress Address of the payment token.
+     */
+    function setPaymentToken(address tokenAddress) external onlyOwner validContract(tokenAddress) {
+        if (!IValidation.validateERC20Token(tokenAddress)) {
+            revert InvalidContractInteraction();
+        }
+        _pause();
+        _paymentToken = tokenAddress;
+        emit PaymentTokenUpdated(_paymentToken);
+    }
+
+    /**
+     * @notice Sets the payment token address zero as the native token.
+     */
+    function setPaymentTokenAsNativeToken() external onlyOwner {
+        _pause();
+        _paymentToken = address(0);
+        emit PaymentTokenUpdated(_paymentToken);
+    }
+
+    /**
+     * @notice Sets the minting price.
+     * @param price New minting price.
+     */
+    function setMintingPrice(uint256 price) external onlyOwner {
+        _mintingPrice = price;
+        emit MintingPriceUpdated(_mintingPrice);
+    }
+
+    /**
+     * @notice Starts the mint sale.
+     */
+    function startMintSale() external onlyOwner {
+        _unpause();
+    }
+
+    /**
+     * @notice Stops the mint sale.
+     */
+    function stopMintSale() external onlyOwner {
+        _pause();
+    }
+
+    function setTradingOnOff(bool _onOff) external onlyOwner {
+        _tradeOnOff = _onOff;
+        emit TradePeriodUpdated(_onOff);
+    }
+
+    function setDefaultRoyalityReceiver(address receiver, uint96 feeNumerator) 
+    validAddress(receiver) external onlyOwner {
+        super._setDefaultRoyalty(receiver, feeNumerator);
+    }
 
     /**
      * @notice Withdraws tokens from the contract.
@@ -496,17 +698,17 @@ contract SoulBounds is Ownable, Pausable {
     }
 
     /**
-     * @notice Pauses the contract, disabling state-changing functions.
-     * @dev Only the owner can pause the contract.
-     */
+    * @notice Pauses the contract, disabling state-changing functions.
+    * @dev Only the owner can pause the contract.
+    */
     function pause() external onlyOwner {
         _pause();
     }
 
     /**
-     * @notice Unpauses the contract, enabling state-changing functions.
-     * @dev Only the owner can unpause the contract.
-     */
+    * @notice Unpauses the contract, enabling state-changing functions.
+    * @dev Only the owner can unpause the contract.
+    */
     function unpause() external onlyOwner {
         _unpause();
     }
