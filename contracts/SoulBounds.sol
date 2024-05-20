@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-/**
-    working on...
-*/
-
 // imports
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { SafeERC20, IERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -12,7 +8,7 @@ import { Pausable } from "@openzeppelin/contracts/security/Pausable.sol";
 import { ERC721Enumerable } from "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
 import { ERC721, IERC721 } from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import { ERC721Holder } from "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
-import { IERC2981, ERC2981 } from "@openzeppelin/contracts/token/common/ERC2981.sol";
+import { ERC2981 } from "@openzeppelin/contracts/token/common/ERC2981.sol";
 import { Strings } from "@openzeppelin/contracts/utils/Strings.sol";
 import { Address } from "./libs/Address.sol";
 import { IValidation } from "./libs/IValidation.sol";
@@ -35,11 +31,12 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
 
     uint256 public constant ZERO = 0;
     uint256 private _mintingPrice;
+    uint256 private _currentTokenId;
     address private _paymentToken;
     address private _royaltyReceiver;
     string private _baseUrl;
     bool private _tradeOnOff;
-    
+
     /**
      * @dev Represents an individual's soul, consisting of their identity and metadata.
      */
@@ -66,19 +63,19 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
      * @dev Emitted when a new soul is minted.
      * @param _soul Address associated with the newly minted soul.
      */
-    event Mint(address indexed _soul);
+    event Mint(address indexed _soul, uint256 _tokenId);
 
     /**
      * @dev Emitted when an existing soul is burned.
      * @param _soul Address associated with the burned soul.
      */
-    event Burn(address indexed _soul);
+    event Burn(address indexed _soul, uint256 _tokenId);
 
     /**
      * @dev Emitted when a soul's data is updated.
      * @param _soul Address of the updated soul.
      */
-    event Update(address indexed _soul);
+    event Update(address indexed _soul, uint256 _tokenId);
 
     /**
      * @dev Emitted when tokens are withdrawn.
@@ -91,6 +88,8 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
     event PaymentTokenUpdated(address indexed _paymentToken);
     event MintingPriceUpdated(uint256 indexed _mintingPrice);
     event TradePeriodUpdated(bool indexed _tradeOnOff);
+    event MintingSessionHasStarted();
+    event MintingSessionHasStopped();
 
     // Errors
     error IncorrectFundsSent();
@@ -110,6 +109,7 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
     error TokenNotExist();
     error TheMetaDataKeyIsImmutable(string reason);
     error InvalidTradePeriod();
+    error FailedToSend();
 
     // Modifiers
 
@@ -149,6 +149,11 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
     /**
      * @dev Sets up the base asset and computes the initial base hash.
      * @param tokenAddress Address of the base asset token.
+     * @param url Base URL for metadata.
+     * @param tokenName Name of the token.
+     * @param symbol Symbol of the token.
+     * @param royaltyReceiver Address to receive royalties.
+     * @param royaltyFeeNumerator Fee numerator for royalties.
      */
     constructor(
         address tokenAddress, 
@@ -166,15 +171,21 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
         _mintingPrice = 0.01 ether; // Default price in case of native token payment
         _baseUrl = url;
         _tradeOnOff = false;
+        _currentTokenId = _startTokenId() - 1;
         _royaltyReceiver = royaltyReceiver;
-        _pause(); // Start paused
         _setDefaultRoyalty(royaltyReceiver, royaltyFeeNumerator);
     }
 
+    /**
+     * @dev Receives native tokens and emits an event.
+     */
     receive() external payable {
         emit NativeTokenReceived(msg.sender, msg.value);
     }
 
+    /**
+     * @dev Fallback function to reject unintended transactions.
+     */
     fallback() external payable {
         revert NotPermitted();
     }
@@ -199,13 +210,14 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
 
         _sanitizeAndValidate(soulAddress);
 
-        uint256 tokenId = totalSupply() + 1;
+        uint256 tokenId = _getNextTokenId();
+        bytes16 _uId =  _generateUUID(soulAddress, 1);
 
         // Register the new soul
         Soul memory newSoul = Soul({
             mintedAt: block.timestamp,
             lastUpdate: block.timestamp,
-            uuid: _generateUUID(soulAddress, 1),
+            uuid: _uId,
             tokenId: tokenId
         });
 
@@ -215,13 +227,13 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
 
         _safeMint(soulAddress, tokenId);
 
-        emit Mint(soulAddress);
+        emit Mint(soulAddress, tokenId);
     }
 
     /**
-    * @notice Burns an existing soul and clears all associated metadata.
-    * @param soulAddress Address of the soul to be burned.
-    */
+     * @notice Burns an existing soul and clears all associated metadata.
+     * @param soulAddress Address of the soul to be burned.
+     */
     function burn(address soulAddress)
         external
         validAddress(soulAddress)
@@ -239,19 +251,19 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
 
         _burn(soulToBurn.tokenId);
 
-        emit Burn(soulAddress);
+        emit Burn(soulAddress, soulToBurn.tokenId);
     }
 
     /* getters ------------------------------------------------------------------------------------ */
 
     /**
-    * @notice Returns the data of a specified soul with optional metadata.
-    * @param soulAddress Address of the soul.
-    * @param includeMetadata If true, includes all metadata in the returned data.
-    * @return soulData Memory struct representing the soul, including optional metadata.
-    * @return keys Array of metadata keys.
-    * @return values Array of metadata values.
-    */
+     * @notice Returns the data of a specified soul with optional metadata.
+     * @param soulAddress Address of the soul.
+     * @param includeMetadata If true, includes all metadata in the returned data.
+     * @return soulData Memory struct representing the soul, including optional metadata.
+     * @return keys Array of metadata keys.
+     * @return values Array of metadata values.
+     */
     function getSoul(address soulAddress, bool includeMetadata) 
     external view returns (Soul memory soulData, bytes32[] memory keys, bytes[] memory values) 
     {
@@ -264,6 +276,12 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
         return (soulData, keys, values);
     }
 
+    /**
+     * @dev Internal function to get metadata for a given soul address.
+     * @param soulAddress Address of the soul.
+     * @return keys Array of metadata keys.
+     * @return values Array of metadata values.
+     */
     function _getMetadata(address soulAddress) internal view returns (bytes32[] memory keys, bytes[] memory values) {
         uint256 metadataCount = _metadataKeys[soulAddress].length;
         bytes32[] memory tempKeys = new bytes32[](metadataCount);
@@ -291,11 +309,11 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
     }
 
     /**
-    * @notice Returns metadata for a given soul address and key.
-    * @param soulAddress Address of the soul.
-    * @param key Metadata key.
-    * @return value Metadata value.
-    */
+     * @notice Returns metadata for a given soul address and key.
+     * @param soulAddress Address of the soul.
+     * @param key Metadata key.
+     * @return value Metadata value.
+     */
     function getMetadata(address soulAddress, bytes32 key) external view validAddress(soulAddress)
     returns (bytes memory value)
     {
@@ -317,6 +335,10 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
         return _paymentToken;
     }
 
+    /**
+     * @notice Returns the trade status.
+     * @return bool Trade status.
+     */
     function getTradeOnOff() external view returns (bool) {
         return _tradeOnOff;
     }
@@ -367,12 +389,32 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
     }
 
     /**
-    * @notice Returns royalty information for a token.
-    * @param tokenId Token ID to query.
-    * @param salePrice Sale price of the token.
-    * @return receiver Address receiving the royalty.
-    * @return royaltyAmount Amount of royalty to be paid.
-    */
+     * @dev Retrieves the UUID of a given soul.
+     * @param soulAddress The address of the soul to retrieve the UUID for.
+     * @return bytes16 The UUID of the specified soul.
+     */
+    function getUUID(address soulAddress) external view returns (bytes16) {
+        Soul memory _soul = _getValidSoul(soulAddress);
+        return _soul.uuid;
+    }
+
+    /**
+     * @notice Retrieves the token ID associated with a given soul address.
+     * @param soulAddress The address of the soul to retrieve the token ID for.
+     * @return uint256 The token ID associated with the specified soul address.
+     */
+    function getTokenId(address soulAddress) external view returns (uint256) {
+        Soul memory _soul = _getValidSoul(soulAddress);
+        return _soul.tokenId;
+    }
+
+    /**
+     * @notice Returns royalty information for a token.
+     * @param tokenId Token ID to query.
+     * @param salePrice Sale price of the token.
+     * @return receiver Address receiving the royalty.
+     * @return royaltyAmount Amount of royalty to be paid.
+     */
     function royaltyInfo(uint256 tokenId, uint256 salePrice) public view override
     returns (address receiver, uint256 royaltyAmount)
     {
@@ -397,7 +439,7 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
             revert MetadataKeyNotAllowed();
         }
         
-        _getValidSoul(soulAddress);
+        Soul memory _soul = _getValidSoul(soulAddress);
 
         bytes32[] storage keys = _metadataKeys[soulAddress];
         bool keyExists = false;
@@ -416,7 +458,7 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
         _soulMetadata[soulAddress][key] = value;
         _souls[soulAddress].lastUpdate = block.timestamp;
 
-        emit Update(soulAddress);
+        emit Update(soulAddress,_soul.tokenId);
     }
 
     /**
@@ -434,7 +476,7 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
             revert MetadataKeyNotAllowed();
         }
 
-        _getValidSoul(soulAddress);
+        Soul memory _soul = _getValidSoul(soulAddress);
 
         if (_immutableMetaDataKeys[key]) revert TheMetaDataKeyIsImmutable("Use forceMetakeySwitch()");
 
@@ -449,13 +491,13 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
             }
         }
 
-        emit Update(soulAddress);
+        emit Update(soulAddress,_soul.tokenId);
     }
 
     /**
-    * @dev Clears all metadata for a given soul address.
-    * @param _soul Address of the soul.
-    */
+     * @dev Clears all metadata for a given soul address.
+     * @param _soul Address of the soul.
+     */
     function clearAllMetadata(address _soul) external onlyOwner whenNotPaused {
         _clearAllMetadataInternal(_soul);
     }
@@ -463,6 +505,7 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
     /**
      * @dev Adds a new metadata key to the whitelist.
      * @param _key The key to be added to the whitelist.
+     * @param _isImmutable Boolean indicating whether the key should be immutable.
      */
     function allowMetadataKey(bytes32 _key, bool _isImmutable) external onlyOwner {
         if (_immutableMetaDataKeys[_key]) revert TheMetaDataKeyIsImmutable("Use forceMetakeySwitch()");
@@ -480,18 +523,25 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
     }
 
     /**
-    * @notice Forcefully switches a metadata key's allowed state and immutability.
-    * This function is restricted to the contract owner.
-    * 
-    * @param _key The metadata key to be modified.
-    * @param _isImmutable Boolean indicating whether the key should be immutable.
-    */
+     * @notice Forcefully switches a metadata key's allowed state and immutability.
+     * @param _key The metadata key to be modified.
+     * @param _isImmutable Boolean indicating whether the key should be immutable.
+     */
     function forceMetakeySwitch(bytes32 _key, bool _isImmutable) external onlyOwner {
         _allowedKeys[_key] = true;
         _immutableMetaDataKeys[_key] = _isImmutable;
     }
 
     /* internal utilities ------------------------------------------------------------------------- */
+
+    /**
+     * @dev Returns the next token ID for minting and increments the current token ID counter.
+     * @return uint256 The next token ID to be minted.
+     */
+    function _getNextTokenId() internal returns (uint256) {
+        _currentTokenId++;
+        return _currentTokenId;
+    }
 
     /**
      * @dev Validates and sanitizes the Soul data fields, considering only specific fields.
@@ -506,12 +556,9 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
     }
 
     /**
-    * @dev Clears all metadata for a given soul address internally.
-    * This function is intended to be called from within the contract,
-    * and it bypasses the `onlyOwner` restriction.
-    * 
-    * @param soulAddress Address of the soul whose metadata is to be cleared.
-    */
+     * @dev Clears all metadata for a given soul address internally.
+     * @param soulAddress Address of the soul.
+     */
     function _clearAllMetadataInternal(address soulAddress) internal {
         _getValidSoul(soulAddress);
 
@@ -537,11 +584,9 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
      */
     function _chainID() internal view returns (uint256) {
         uint256 chainID;
-        /* solhint-disable */
         assembly {
             chainID := chainid()
         }
-        /* solhint-enable */
         return chainID;
     }
 
@@ -625,25 +670,41 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
     /* administrator -------------------------------------------------------------------------------- */
 
     /**
+     * @notice Checks the contract liveness.
+     * @dev whenNotPaused returns Paused error when the contract is not working.
+     * @return bool if the contract is working.
+     */
+     function liveness() external view onlyOwner whenNotPaused returns(bool) {
+        return true;
+     }
+
+    /**
      * @notice Sets the payment token address.
      * @param tokenAddress Address of the payment token.
+     * @param _newMintingPrice New minting price.
      */
-    function setPaymentToken(address tokenAddress) external onlyOwner validContract(tokenAddress) {
+    function setPaymentToken(address tokenAddress, uint256 _newMintingPrice) 
+    external onlyOwner validContract(tokenAddress) {
         if (!IValidation.validateERC20Token(tokenAddress)) {
             revert InvalidContractInteraction();
         }
         _pause();
         _paymentToken = tokenAddress;
         emit PaymentTokenUpdated(_paymentToken);
+        _mintingPrice = _newMintingPrice;
+        emit MintingPriceUpdated(_mintingPrice);
     }
 
     /**
      * @notice Sets the payment token address zero as the native token.
+     * @param _newMintingPrice New minting price.
      */
-    function setPaymentTokenAsNativeToken() external onlyOwner {
+    function setPaymentTokenAsNativeToken(uint256 _newMintingPrice) external onlyOwner {
         _pause();
         _paymentToken = address(0);
         emit PaymentTokenUpdated(_paymentToken);
+        _mintingPrice = _newMintingPrice;
+        emit MintingPriceUpdated(_mintingPrice);
     }
 
     /**
@@ -660,6 +721,7 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
      */
     function startMintSale() external onlyOwner {
         _unpause();
+        emit MintingSessionHasStarted();
     }
 
     /**
@@ -667,16 +729,37 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
      */
     function stopMintSale() external onlyOwner {
         _pause();
+        emit MintingSessionHasStopped();
     }
 
+    /**
+     * @notice Sets the trading status.
+     * @param _onOff Boolean indicating the trading status.
+     */
     function setTradingOnOff(bool _onOff) external onlyOwner {
         _tradeOnOff = _onOff;
         emit TradePeriodUpdated(_onOff);
     }
 
+    /**
+     * @notice Sets the default royalty receiver and fee numerator.
+     * @param receiver Address of the royalty receiver.
+     * @param feeNumerator Fee numerator for royalties.
+     */
     function setDefaultRoyalityReceiver(address receiver, uint96 feeNumerator) 
-    validAddress(receiver) external onlyOwner {
+    external validAddress(receiver) onlyOwner {
         super._setDefaultRoyalty(receiver, feeNumerator);
+    }
+
+    /**
+     * @dev Withdraws native tokens to the owner's address.
+     */
+    function withdraw() external onlyOwner {
+        uint256 balance = address(this).balance;
+        (bool success, ) = payable(owner()).call{value: balance}("");
+        if (!success) {
+            revert FailedToSend();
+        }
     }
 
     /**
@@ -698,17 +781,17 @@ contract SoulBounds is Ownable, Pausable, ERC721, ERC721Enumerable, ERC721Holder
     }
 
     /**
-    * @notice Pauses the contract, disabling state-changing functions.
-    * @dev Only the owner can pause the contract.
-    */
+     * @notice Pauses the contract, disabling state-changing functions.
+     * @dev Only the owner can pause the contract.
+     */
     function pause() external onlyOwner {
         _pause();
     }
 
     /**
-    * @notice Unpauses the contract, enabling state-changing functions.
-    * @dev Only the owner can unpause the contract.
-    */
+     * @notice Unpauses the contract, enabling state-changing functions.
+     * @dev Only the owner can unpause the contract.
+     */
     function unpause() external onlyOwner {
         _unpause();
     }
